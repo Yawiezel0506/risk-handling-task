@@ -76,6 +76,15 @@ When a **new** event is stored for a correlation, the engine tries to compute ri
 
 Consumer calls `tryComputeAndStoreRisk` only after a **new** event (inserted), so we don’t recompute on every duplicate.
 
+## REST API (risk lookup)
+
+**`GET /risk?merchantId=...&orderId=...`** — Look up risk by merchant and order.
+
+- **`src/risk/get.ts`** — `getRiskByMerchantAndOrder(pool, merchantId, orderId)`: single SELECT, returns `{ score, signalBreakdown, expiresAt } | null`.
+- **`src/api/risk.ts`** — `handleGetRisk(req, res, pool)`: parses query params; calls get; responds 200 with `status: "found" | "expired" | "missing"`. For found/expired includes `score`, `signalBreakdown`, `expiresAt` (ISO). Missing params → 400; other methods → 405.
+- **`src/api/index.ts`** — Re-exports `handleGetRisk`.
+- **`src/index.ts`** — For `GET` and URL starting with `/risk`, delegates to `handleGetRisk(req, res, getPool())`.
+
 ## Modular layout (risk-engine)
 
 - **`src/db/pool.ts`** — PostgreSQL pool creation and `getPool()`.
@@ -113,11 +122,14 @@ HTTP server and consumer start after `runMigrations()`; consumer runs in backgro
    - **Risk scores in DB:**  
      `docker compose exec postgres psql -U chargeflow -d chargeflow -c 'SELECT merchant_id, order_id, score, expires_at FROM risk_scores LIMIT 5;'`  
      Should show rows once correlations have both order and payment.
+   - **Risk API:**  
+     `curl "http://localhost:3001/risk?merchantId=merch_globex&orderId=ord_7efa68db"`  
+     Expected: `{"status":"found","score":55,"signalBreakdown":{...},"expiresAt":"..."}` (or `expired` / `missing`).
 
 ## Next steps (implementation order)
 
 1. ~~**Validation**~~ — Done (Joi schemas per topic; `validateEvent(topic, raw)`).
 2. ~~**Kafka consumer + idempotent events**~~ — Done.
 3. ~~**Scoring**~~ — Done. On each new event, `tryComputeAndStoreRisk` loads correlation; if order + payment, computes via five risk-signals and upserts `risk_scores` with `signal_breakdown` and `expires_at` (env `RISK_SCORE_TTL_HOURS`).
-4. **REST API** — e.g. `GET /risk?merchantId=...&orderId=...` returning score + status (found / expired / missing).
+4. ~~**REST API**~~ — Done. `GET /risk?merchantId=...&orderId=...` returns 200 with `status` (found / expired / missing) and when found/expired: `score`, `signalBreakdown`, `expiresAt`.
 5. **Polish** — Configurable TTL, logging, tests, small logical commits.

@@ -1,0 +1,1 @@
+export { handleGetRisk } from "./risk";

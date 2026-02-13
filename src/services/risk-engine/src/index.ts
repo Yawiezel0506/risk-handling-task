@@ -1,4 +1,6 @@
 import http from "node:http";
+import { handleGetRisk } from "./api";
+import { getPool } from "./db";
 import { runMigrations } from "./db";
 import { startConsumer } from "./kafka";
 
@@ -16,6 +18,11 @@ async function main() {
     if (req.url === "/health" && req.method === "GET") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    if (req.url?.startsWith("/risk") && req.method === "GET") {
+      handleGetRisk(req, res, getPool());
       return;
     }
 
