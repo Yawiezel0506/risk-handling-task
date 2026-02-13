@@ -1,0 +1,123 @@
+version: "3.8"
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v23.3.5
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redpanda-console:
+    image: redpandadata/console:v2.4.3
+    container_name: redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: chargeflow
+      POSTGRES_PASSWORD: chargeflow
+      POSTGRES_DB: chargeflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chargeflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  init-kafka:
+    image: redpandadata/redpanda:v23.3.5
+    container_name: init-kafka
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      rpk topic create orders.v1 --brokers redpanda:29092
+      rpk topic create payments.v1 --brokers redpanda:29092
+      rpk topic create disputes.v1 --brokers redpanda:29092
+      echo 'Topics created.'
+      "
+
+  event-generator:
+    build:
+      context: .
+      dockerfile: ./src/services/event-generator/Dockerfile
+    container_name: event-generator
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      TOPIC_ORDERS: orders.v1
+      TOPIC_PAYMENTS: payments.v1
+      TOPIC_DISPUTES: disputes.v1
+      EVENT_INTERVAL_MS: 5000
+      ENABLE_DUPLICATES: "true"
+      DUPLICATE_RATE: "0.1"
+      ENABLE_OUT_OF_ORDER: "true"
+
+  risk-engine:
+    build:
+      context: .
+      dockerfile: ./src/services/risk-engine/Dockerfile
+    container_name: risk-engine
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      KAFKA_BROKERS: redpanda:29092
+      TOPIC_ORDERS: orders.v1
+      TOPIC_PAYMENTS: payments.v1
+      TOPIC_DISPUTES: disputes.v1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: chargeflow
+      POSTGRES_PASSWORD: chargeflow
+      POSTGRES_DB: chargeflow
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
