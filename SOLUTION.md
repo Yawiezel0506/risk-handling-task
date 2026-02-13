@@ -55,14 +55,26 @@ Event payloads are validated with **Joi** before processing. Unknown topics are 
 
 The Kafka consumer calls `validateEvent(topic, message.value)` and skips or logs invalid events.
 
-## Kafka consumer (consume + validate)
+## Kafka consumer (consume + validate + store + score)
 
-Single consumer subscribes to all three topics, validates each message, logs ok or invalid. No DB write yet.
+Single consumer subscribes to all three topics. For each message: validate → idempotent insert into `processed_events` → if new event, try to compute and store risk for that correlation.
 
-- **`src/kafka/consumer.ts`** — Kafka client and consumer; config from env (`KAFKA_BROKERS`, `TOPIC_ORDERS`, `TOPIC_PAYMENTS`, `TOPIC_DISPUTES`, `KAFKA_GROUP_ID`). `startConsumer()`: connect, subscribe, `eachMessage` → parse value, `validateEvent(topic, raw)`, log `[kafka] ok` or `[kafka] invalid`; on non-validation errors rethrow.
+- **`src/kafka/consumer.ts`** — Kafka client and consumer; config from env. `eachMessage`: parse, `validateEvent`, `insertProcessedEvent`; if inserted, `tryComputeAndStoreRisk(correlationId)`; log `[kafka] ok` and optionally `[kafka] risk scored`.
 - **`src/kafka/index.ts`** — Re-exports `startConsumer`.
 
-Started in parallel with the HTTP server (fire-and-forget after `runMigrations()`). risk-engine now depends on `init-kafka` (completed) so topics exist before consume.
+Started in parallel with the HTTP server after `runMigrations()`. Depends on `init-kafka` so topics exist.
+
+## Risk scoring (modular)
+
+When a **new** event is stored for a correlation, the engine tries to compute risk for that correlation. If both order and payment events exist, it scores and upserts into `risk_scores`.
+
+- **`src/risk/score.ts`** — Pure: `computeScore(order, payment)` using all five `@chargeflow/risk-signals` (ipVelocity, deviceReuse, emailDomainReputation, binCountryMismatch, chargebackHistory). Sum 0–20 each → clamp 0–100; returns `{ score, signalBreakdown }`. No history DB yet: ipVelocity and deviceReuse use empty lists (score 0).
+- **`src/risk/assemble.ts`** — `getCorrelationEvents(pool, correlationId)`: loads rows from `processed_events` by `correlation_id`, parses payloads with `validateEvent`, returns `{ order?, payment?, dispute? }`.
+- **`src/risk/store.ts`** — `upsertRiskScore(pool, row)`: INSERT … ON CONFLICT (merchant_id, order_id) DO UPDATE; row includes `expires_at` (TTL).
+- **`src/risk/run.ts`** — `tryComputeAndStoreRisk(pool, correlationId)`: get events; if order + payment, compute score, set `expires_at` from `RISK_SCORE_TTL_HOURS` (default 24), upsert; returns true if score was stored.
+- **`src/risk/index.ts`** — Re-exports score, assemble, store, run.
+
+Consumer calls `tryComputeAndStoreRisk` only after a **new** event (inserted), so we don’t recompute on every duplicate.
 
 ## Modular layout (risk-engine)
 
@@ -70,10 +82,13 @@ Started in parallel with the HTTP server (fire-and-forget after `runMigrations()
 - **`src/db/schema.sql`** — DDL only; `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` so startup is idempotent.
 - **`src/db/migrate.ts`** — Loads and runs `schema.sql` once at startup.
 - **`src/db/index.ts`** — Re-exports `getPool` and `runMigrations`.
-- **`src/kafka/consumer.ts`** — Kafka consumer; `startConsumer()` subscribes to the three topics and validates each message.
+- **`src/events/store.ts`** — `insertProcessedEvent(pool, row)`; idempotent by `event_id`.
+- **`src/events/index.ts`** — Re-exports events store.
+- **`src/risk/*`** — score (pure), assemble (load by correlation), store (upsert risk_scores), run (tryComputeAndStoreRisk).
+- **`src/kafka/consumer.ts`** — Consume → validate → insert event → try score.
 - **`src/kafka/index.ts`** — Re-exports `startConsumer`.
 
-The HTTP server and consumer start after `runMigrations()`; consumer runs in the background.
+HTTP server and consumer start after `runMigrations()`; consumer runs in background.
 
 ## Running
 
@@ -94,12 +109,15 @@ The HTTP server and consumer start after `runMigrations()`; consumer runs in the
    - **Validation (Joi):**  
      `docker compose exec risk-engine bun run verify-validation`  
      Expected: lines like `Validating order event...`, `order id: e1`, then `Validation OK.`
-   - **Consumer:** With stack up, risk-engine logs should show `[kafka] ok` every few seconds (one per event). No `[kafka] invalid` unless event-generator sends bad data.
+   - **Consumer:** Logs show `[kafka] ok` (with `stored: "new"` or `"duplicate"`) and `[kafka] risk scored` when a correlation has order + payment and a score is written.
+   - **Risk scores in DB:**  
+     `docker compose exec postgres psql -U chargeflow -d chargeflow -c 'SELECT merchant_id, order_id, score, expires_at FROM risk_scores LIMIT 5;'`  
+     Should show rows once correlations have both order and payment.
 
 ## Next steps (implementation order)
 
 1. ~~**Validation**~~ — Done (Joi schemas per topic; `validateEvent(topic, raw)`).
-2. ~~**Kafka consumer (consume + validate)**~~ — Done. Next: insert into `processed_events` (idempotent), then correlation + scoring.
-3. **Scoring** — For each correlation with at least order + payment, call the five risk-signal functions, sum (capped at 100), and upsert `risk_scores` with `signal_breakdown` and `expires_at`.
+2. ~~**Kafka consumer + idempotent events**~~ — Done.
+3. ~~**Scoring**~~ — Done. On each new event, `tryComputeAndStoreRisk` loads correlation; if order + payment, computes via five risk-signals and upserts `risk_scores` with `signal_breakdown` and `expires_at` (env `RISK_SCORE_TTL_HOURS`).
 4. **REST API** — e.g. `GET /risk?merchantId=...&orderId=...` returning score + status (found / expired / missing).
 5. **Polish** — Configurable TTL, logging, tests, small logical commits.
