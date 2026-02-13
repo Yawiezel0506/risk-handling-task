@@ -53,7 +53,16 @@ Event payloads are validated with **Joi** before processing. Unknown topics are 
 - **`src/validation/validate.ts`** — `validateEvent(topic, raw)` parses JSON if needed, validates against the topic schema, returns typed `ValidatedEvent` or throws `ValidationError`. Exports `TOPIC_ORDER`, `TOPIC_PAYMENT`, `TOPIC_DISPUTE` and types `ValidatedOrderEvent`, `ValidatedPaymentEvent`, `ValidatedDisputeEvent`.
 - **`src/validation/index.ts`** — Re-exports schemas, `validateEvent`, `ValidationError`, and types.
 
-The Kafka consumer will call `validateEvent(topic, message.value)` and skip or log invalid events.
+The Kafka consumer calls `validateEvent(topic, message.value)` and skips or logs invalid events.
+
+## Kafka consumer (consume + validate)
+
+Single consumer subscribes to all three topics, validates each message, logs ok or invalid. No DB write yet.
+
+- **`src/kafka/consumer.ts`** — Kafka client and consumer; config from env (`KAFKA_BROKERS`, `TOPIC_ORDERS`, `TOPIC_PAYMENTS`, `TOPIC_DISPUTES`, `KAFKA_GROUP_ID`). `startConsumer()`: connect, subscribe, `eachMessage` → parse value, `validateEvent(topic, raw)`, log `[kafka] ok` or `[kafka] invalid`; on non-validation errors rethrow.
+- **`src/kafka/index.ts`** — Re-exports `startConsumer`.
+
+Started in parallel with the HTTP server (fire-and-forget after `runMigrations()`). risk-engine now depends on `init-kafka` (completed) so topics exist before consume.
 
 ## Modular layout (risk-engine)
 
@@ -61,8 +70,10 @@ The Kafka consumer will call `validateEvent(topic, message.value)` and skip or l
 - **`src/db/schema.sql`** — DDL only; `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` so startup is idempotent.
 - **`src/db/migrate.ts`** — Loads and runs `schema.sql` once at startup.
 - **`src/db/index.ts`** — Re-exports `getPool` and `runMigrations`.
+- **`src/kafka/consumer.ts`** — Kafka consumer; `startConsumer()` subscribes to the three topics and validates each message.
+- **`src/kafka/index.ts`** — Re-exports `startConsumer`.
 
-The HTTP server runs only after `runMigrations()` has completed successfully.
+The HTTP server and consumer start after `runMigrations()`; consumer runs in the background.
 
 ## Running
 
@@ -74,7 +85,7 @@ The HTTP server runs only after `runMigrations()` has completed successfully.
 
 1. **Run:** `docker compose up --build`
 2. **What you should see:**
-   - All containers start; `risk-engine` logs: `risk-engine listening on 3001` (no crash before that).
+   - All containers start; `risk-engine` logs: `[kafka] consumer running` then `risk-engine listening on 3001`. Shortly after, `[kafka] ok` lines as events are consumed and validated (event-generator emits every ~5s).
    - Optional: `event-generator` logs `chargeflow-event-generator connected`; you may see `TimeoutNegativeWarning` (harmless).
 3. **Check inside Docker:**
    - **Health:**  
@@ -82,12 +93,13 @@ The HTTP server runs only after `runMigrations()` has completed successfully.
      Expected: `{"status":"ok"}`
    - **Validation (Joi):**  
      `docker compose exec risk-engine bun run verify-validation`  
-     Expected: lines like `Validating order event...`, `order id: e1`, `Validating payment event...`, `caught ValidationError: ...`, then `Validation OK.`
+     Expected: lines like `Validating order event...`, `order id: e1`, then `Validation OK.`
+   - **Consumer:** With stack up, risk-engine logs should show `[kafka] ok` every few seconds (one per event). No `[kafka] invalid` unless event-generator sends bad data.
 
 ## Next steps (implementation order)
 
 1. ~~**Validation**~~ — Done (Joi schemas per topic; `validateEvent(topic, raw)`).
-2. **Kafka consumer** — Subscribe to `orders.v1`, `payments.v1`, `disputes.v1`; validate with `validateEvent`; insert into `processed_events` with idempotency; trigger correlation assembly.
+2. ~~**Kafka consumer (consume + validate)**~~ — Done. Next: insert into `processed_events` (idempotent), then correlation + scoring.
 3. **Scoring** — For each correlation with at least order + payment, call the five risk-signal functions, sum (capped at 100), and upsert `risk_scores` with `signal_breakdown` and `expires_at`.
 4. **REST API** — e.g. `GET /risk?merchantId=...&orderId=...` returning score + status (found / expired / missing).
 5. **Polish** — Configurable TTL, logging, tests, small logical commits.
