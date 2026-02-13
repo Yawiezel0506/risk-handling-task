@@ -1,4 +1,6 @@
 import { Kafka } from "kafkajs";
+import { getPool } from "../db";
+import { insertProcessedEvent } from "../events";
 import { validateEvent, ValidationError } from "../validation";
 
 const brokers = (process.env.KAFKA_BROKERS ?? "localhost:9092").split(",");
@@ -26,7 +28,18 @@ export async function startConsumer(): Promise<void> {
 
       try {
         const event = validateEvent(topic, raw);
-        console.log("[kafka] ok", { topic, eventId: event.id, correlationId: event.correlationId });
+        const inserted = await insertProcessedEvent(getPool(), {
+          eventId: event.id,
+          correlationId: event.correlationId,
+          topic,
+          payload: raw,
+        });
+        console.log("[kafka] ok", {
+          topic,
+          eventId: event.id,
+          correlationId: event.correlationId,
+          stored: inserted ? "new" : "duplicate",
+        });
       } catch (err) {
         if (err instanceof ValidationError) {
           console.warn("[kafka] invalid", { topic, reason: err.message.slice(0, 100) });
