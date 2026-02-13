@@ -45,6 +45,16 @@ Schema is applied at service startup via a single idempotent SQL file (`src/serv
 - **Out-of-order:** Recomputing on every new event for a correlation (or when a “complete” bundle is detected) keeps the stored score consistent regardless of event order.
 - **TTL:** `expires_at` is set at write time from a configurable TTL (e.g. `RISK_SCORE_TTL_HOURS`). The API can return 410 Gone or “expired” when `now() > expires_at`.
 
+## Validation (Joi)
+
+Event payloads are validated with **Joi** before processing. Unknown topics are rejected; malformed or missing required fields throw `ValidationError` (with topic and details).
+
+- **`src/validation/schemas.ts`** — CloudEvents envelope + per-topic data schemas: `orderEventSchema` (order.created), `paymentEventSchema` (payment.authorized), `disputeEventSchema` (dispute.opened). Required fields and types (e.g. `email`, `amt`, `order_id`) are enforced.
+- **`src/validation/validate.ts`** — `validateEvent(topic, raw)` parses JSON if needed, validates against the topic schema, returns typed `ValidatedEvent` or throws `ValidationError`. Exports `TOPIC_ORDER`, `TOPIC_PAYMENT`, `TOPIC_DISPUTE` and types `ValidatedOrderEvent`, `ValidatedPaymentEvent`, `ValidatedDisputeEvent`.
+- **`src/validation/index.ts`** — Re-exports schemas, `validateEvent`, `ValidationError`, and types.
+
+The Kafka consumer will call `validateEvent(topic, message.value)` and skip or log invalid events.
+
 ## Modular layout (risk-engine)
 
 - **`src/db/pool.ts`** — PostgreSQL pool creation and `getPool()`.
@@ -60,10 +70,24 @@ The HTTP server runs only after `runMigrations()` has completed successfully.
 - If the browser is blocked (e.g. Zscaler), health can be checked from inside the container:
   - `docker compose exec risk-engine bun -e "console.log(await (await fetch('http://127.0.0.1:3001/health')).text())"`
 
+## After every change: verify
+
+1. **Run:** `docker compose up --build`
+2. **What you should see:**
+   - All containers start; `risk-engine` logs: `risk-engine listening on 3001` (no crash before that).
+   - Optional: `event-generator` logs `chargeflow-event-generator connected`; you may see `TimeoutNegativeWarning` (harmless).
+3. **Check inside Docker:**
+   - **Health:**  
+     `docker compose exec risk-engine bun -e "console.log(await (await fetch('http://127.0.0.1:3001/health')).text())"`  
+     Expected: `{"status":"ok"}`
+   - **Validation (Joi):**  
+     `docker compose exec risk-engine bun run verify-validation`  
+     Expected: lines like `Validating order event...`, `order id: e1`, `Validating payment event...`, `caught ValidationError: ...`, then `Validation OK.`
+
 ## Next steps (implementation order)
 
-1. **Validation** — Reject malformed or unknown event types; validate required fields per topic.
-2. **Kafka consumer** — Subscribe to `orders.v1`, `payments.v1`, `disputes.v1`; insert into `processed_events` with idempotency; trigger correlation assembly.
+1. ~~**Validation**~~ — Done (Joi schemas per topic; `validateEvent(topic, raw)`).
+2. **Kafka consumer** — Subscribe to `orders.v1`, `payments.v1`, `disputes.v1`; validate with `validateEvent`; insert into `processed_events` with idempotency; trigger correlation assembly.
 3. **Scoring** — For each correlation with at least order + payment, call the five risk-signal functions, sum (capped at 100), and upsert `risk_scores` with `signal_breakdown` and `expires_at`.
 4. **REST API** — e.g. `GET /risk?merchantId=...&orderId=...` returning score + status (found / expired / missing).
 5. **Polish** — Configurable TTL, logging, tests, small logical commits.
